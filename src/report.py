@@ -51,6 +51,10 @@ def _survey_line(survey: Survey, is_new: bool = False) -> str:
     tags = [pay]
     if survey.platforms:
         tags.append("/".join("PC" if p == "pc" else "모바일" for p in survey.platforms))
+    if survey.minutes:
+        tags.append(f"{survey.minutes}분")
+    if survey.deadline:
+        tags.append(f"~{survey.deadline}")
     if survey.has_gift:
         tags.append("경품")
     if survey.completed:

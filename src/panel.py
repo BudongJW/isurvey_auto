@@ -25,6 +25,8 @@ class Survey:
     has_gift: bool           # 경품 조사 여부
     platforms: list[str]     # "pc", "mobile"
     completed: bool          # 이미 참여 완료한 조사
+    deadline: str = ""       # 마감일 (YYYY-MM-DD)
+    minutes: int | None = None   # 예상 소요 시간(분)
     raw: dict = field(repr=False, default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -63,6 +65,8 @@ def parse_survey(item: dict) -> Survey:
         has_gift=bool(str(item.get("giftNm") or "").strip()),
         platforms=platforms,
         completed=str(item.get("isCpltYn") or "").upper() == "Y",
+        deadline=str(item.get("srvEndDt") or "")[:10],
+        minutes=to_int(item.get("needTime")),
         raw=item,
     )
 

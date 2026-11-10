@@ -4,6 +4,7 @@
     python -m src.main status                       적립금 + 참여 가능 조사 (기본)
     python -m src.main surveys [--sort pay|deadline|latest]
     python -m src.main history [--months 1|3|6|12]  참여/적립/지급 내역
+    python -m src.main keepalive [--interval 분]    세션이 만료되지 않게 주기적으로 토큰 갱신
     python -m src.main logout
 """
 import argparse
@@ -41,6 +42,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
     p = sub.add_parser("history", help="조사 참여 / 적립 / 지급 내역")
     p.add_argument("--months", type=int, choices=panel.HISTORY_MONTHS, default=3)
+
+    p = sub.add_parser("keepalive", help="저장된 세션이 만료되지 않게 주기적으로 갱신한다 (Ctrl+C 로 종료)")
+    p.add_argument("--interval", type=float, default=10, metavar="분",
+                   help="갱신 주기(분). 리프레시 토큰 수명이 30분이라 그보다 충분히 짧아야 한다 (기본 10)")
 
     sub.add_parser("logout", help="로그아웃하고 저장된 세션을 지운다")
 
@@ -104,7 +109,36 @@ async def _history(api: PanelApi, months: int) -> None:
     logger.info(f"스냅샷 저장: {path}")
 
 
+async def _wait(seconds: float) -> None:
+    await asyncio.sleep(seconds)
+
+
+async def _keepalive(interval_min: float) -> int:
+    """저장된 세션을 주기적으로 갱신한다.
+
+    리프레시 토큰은 발급 후 30분이면 만료되고, 갱신할 때마다 새 30분짜리로 교체된다.
+    그래서 30분 넘게 아무 호출이 없으면 보안문자를 넣고 다시 로그인해야 한다.
+    매번 브라우저를 새로 열어 확인하고, 닫을 때 교체된 토큰이 파일에 저장된다.
+    """
+    while True:
+        try:
+            async with open_session() as page:
+                alive = await auth.is_logged_in(PanelApi(page))
+        except ApiError as e:
+            # 일시 오류는 다음 주기에 다시 시도한다 (주기가 수명보다 충분히 짧아야 하는 이유)
+            logger.warning(f"세션 확인 실패 — 다음 주기에 재시도: {e}")
+        else:
+            if not alive:
+                logger.error("세션이 만료되었습니다 — `python -m src.main login` 으로 다시 로그인하세요")
+                return EXIT_LOGIN_REQUIRED
+            logger.info(f"세션 유지 중 — {interval_min:g}분 뒤 다시 갱신")
+        await _wait(interval_min * 60)
+
+
 async def run(args: argparse.Namespace) -> int:
+    if args.command == "keepalive":
+        return await _keepalive(args.interval)
+
     in_browser = args.command == "login" and args.headed
     async with open_session(headless=False if in_browser else None) as page:
         api = PanelApi(page)

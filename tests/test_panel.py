@@ -150,6 +150,26 @@ def test_saved_session_is_reused_and_expired_token_refreshed(site):
     assert saved_tokens()["refreshToken"] == site.refresh_token == "refresh-2"
 
 
+def test_keepalive_refreshes_until_session_is_gone(site, monkeypatch):
+    asyncio.run(_login(site, CAPTCHA))
+    rounds = []
+
+    async def next_round(seconds):
+        """기다리는 대신 다음 주기로 넘어간다: 액세스 토큰 만료 → 그다음엔 세션 자체가 만료."""
+        rounds.append(seconds)
+        if len(rounds) == 1:
+            site.expire_access_token()
+        else:
+            site.access_token = site.refresh_token = ""
+
+    monkeypatch.setattr(main, "_wait", next_round)
+
+    assert run_cli("keepalive", "--interval", "7") == main.EXIT_LOGIN_REQUIRED
+    assert rounds == [420, 420]
+    assert site.count("POST /api/auth/refresh") == 2      # 2회차 갱신 성공, 3회차는 거절 → 종료
+    assert saved_tokens()["refreshToken"] == "refresh-2"  # 갱신된 토큰이 파일에 저장됨
+
+
 # ─── CLI ───
 
 def test_cli_requires_login_when_no_terminal(site, monkeypatch):
@@ -168,7 +188,7 @@ def test_cli_status_history_logout(site, capsys):
     assert "잔여 5,300원 | 총 적립 15,300원 | 지급 완료 10,000원" in out
     assert "확인 필요: 이메일 확인" in out
     assert "참여 가능 조사 10건" in out and "신규" not in out     # 두 페이지(9+2) 중 완료 1건 제외
-    assert "[1011] 조사 11 — 5,500원 · PC/모바일" in out
+    assert "[1011] 조사 11 — 5,500원 · PC/모바일 · 12분 · ~2026-11-30" in out
     snapshot = json.loads((config.DATA_DIR / "status.json").read_text(encoding="utf-8"))
     assert len(snapshot["surveys"]) == 10 and snapshot["points"]["remain"] == 5300
 

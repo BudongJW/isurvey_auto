@@ -77,7 +77,7 @@ def _png(width: int = 20, height: int = 10) -> bytes:
 
 def _survey(n: int, **extra) -> dict:
     return {"surveyId": 1000 + n, "srvNm": f"조사 {n}", "payTpCd": "0", "srvPay": 500 * n,
-            "srvTpCd": "2", "isCpltYn": "N", **extra}
+            "srvTpCd": "2", "isCpltYn": "N", "srvEndDt": "2026-11-30T00:00:00", "needTime": "12", **extra}
 
 
 class FakePanelSite:
