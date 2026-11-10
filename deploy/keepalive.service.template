@@ -1,0 +1,27 @@
+[Unit]
+Description=패널파워(panel.co.kr) 세션 유지 — 주기적으로 로그인 토큰을 갱신한다
+Documentation=https://github.com/BudongJW/isurvey_auto
+# 네트워크가 올라온 뒤에 시작한다
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+# 계정 정보(.env)는 앱이 WorkingDirectory 에서 직접 읽는다(python-dotenv).
+# systemd EnvironmentFile 을 쓰지 않으므로 비밀번호에 특수문자가 있어도 안전하다.
+ExecStart=@PYTHON@ -m src.main keepalive --interval @INTERVAL@
+
+# 네트워크 등 일시적 오류로 죽으면 잠시 쉬었다 다시 띄운다
+Restart=on-failure
+RestartSec=30
+# 세션이 만료되면(종료 코드 3) 사람이 보안문자로 다시 로그인해야 하므로,
+# 자동 재시작하지 않고 멈춘다. (OnFailure 로 알림을 걸 수 있다 — README 참고)
+RestartPreventExitStatus=3
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=panelpower-keepalive
+
+[Install]
+WantedBy=default.target
