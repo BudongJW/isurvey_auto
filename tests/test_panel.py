@@ -116,6 +116,23 @@ def test_login_replaces_stale_session(site):
     assert saved_tokens()["refreshToken"] == site.refresh_token
 
 
+def test_captcha_answer_file_when_no_terminal(site, monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO())
+    answer_path = config.STATE_PATH.parent / "captcha.txt"
+
+    async def login_with_answer_file():
+        async with site.open_session() as page:
+            task = asyncio.create_task(auth.login(page, USER_ID, PASSWORD))
+            while not (config.STATE_PATH.parent / "captcha.png").exists():
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)                   # 이미지가 저장된 뒤에 사람이 값을 적는다
+            answer_path.write_text(CAPTCHA + "\n", encoding="utf-8")
+            return await task
+
+    assert asyncio.run(login_with_answer_file()).ok
+    assert not answer_path.exists()
+
+
 # ─── 세션 재사용 ───
 
 def test_saved_session_is_reused_and_expired_token_refreshed(site):

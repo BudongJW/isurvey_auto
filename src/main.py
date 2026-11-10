@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         return asyncio.run(run(_parse_args(argv)))
-    except ApiError as e:
+    except (ApiError, auth.LoginAborted) as e:
         logger.error(str(e))
         return EXIT_FAILED
 

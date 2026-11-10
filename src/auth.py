@@ -4,10 +4,12 @@
 (자동 인식하지 않는다), 한 번 로그인한 세션을 저장해 두고 재사용한다.
 
 - 기본: 보안문자 이미지를 파일로 저장하고 터미널에서 값을 입력받는다.
+  터미널이 없으면(백그라운드·원격 실행) 이미지 옆 captcha.txt 에 값이 적히기를 기다린다.
 - in_browser=True: 열린 브라우저 창에서 사용자가 직접 보안문자를 넣고 [로그인]을 누른다.
 """
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -69,10 +71,32 @@ def parse_login_response(status: int, payload: object) -> LoginOutcome:
     return LoginOutcome(ok=False, result=result, message=str(message), fail_count=fail_count)
 
 
+class LoginAborted(Exception):
+    """보안문자 값을 받지 못해 로그인 요청을 보내지 않고 중단함."""
+
+
 async def prompt_captcha(image_path: Path) -> str:
-    """보안문자 이미지를 사람이 보고 터미널에 입력한다."""
-    print(f"\n보안문자 이미지를 저장했습니다: {image_path.resolve()}")
-    return (await asyncio.to_thread(input, "이미지에 보이는 보안문자를 입력하세요: ")).strip()
+    """보안문자 이미지를 사람이 보고 입력한다 — 터미널, 터미널이 없으면 captcha.txt 파일로."""
+    if sys.stdin.isatty():
+        print(f"\n보안문자 이미지를 저장했습니다: {image_path.resolve()}")
+        return (await asyncio.to_thread(input, "이미지에 보이는 보안문자를 입력하세요: ")).strip()
+
+    answer_path = image_path.with_suffix(".txt")
+    answer_path.unlink(missing_ok=True)
+    logger.info(
+        f"보안문자 이미지: {image_path.resolve()} — 값을 {answer_path.resolve()} 에 적어 주세요"
+        f" (최대 {config.CAPTCHA_WAIT_SEC}초 대기)"
+    )
+    for _ in range(config.CAPTCHA_WAIT_SEC * 2):
+        try:
+            answer = answer_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            answer = ""
+        if answer:
+            answer_path.unlink(missing_ok=True)
+            return answer
+        await asyncio.sleep(0.5)
+    raise LoginAborted(f"보안문자 값을 받지 못했습니다 ({answer_path})")
 
 
 async def is_logged_in(api: PanelApi) -> bool:
