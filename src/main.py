@@ -17,7 +17,7 @@ from playwright.async_api import Page
 
 from src import auth, config, panel, report
 from src.api import ApiError, PanelApi
-from src.session import ensure_origin, open_session, read_auth
+from src.session import SessionBusy, ensure_origin, open_session, read_auth
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,11 @@ def _credentials(in_browser: bool) -> tuple[str, str]:
     user_id, password = config.PANEL_ID, config.PANEL_PW
     if in_browser:
         return user_id, password
+    if not (user_id and password) and not sys.stdin.isatty():
+        raise auth.LoginAborted(
+            "아이디/비밀번호가 없고 입력받을 터미널도 없습니다 — "
+            "PANEL_ID, PANEL_PW 를 .env 나 환경변수로 설정하세요"
+        )
     if not user_id:
         user_id = input("패널파워 아이디: ").strip()
     if not password:
@@ -124,7 +129,7 @@ async def _keepalive(interval_min: float) -> int:
         try:
             async with open_session() as page:
                 alive = await auth.is_logged_in(PanelApi(page))
-        except ApiError as e:
+        except (ApiError, SessionBusy) as e:
             # 일시 오류는 다음 주기에 다시 시도한다 (주기가 수명보다 충분히 짧아야 하는 이유)
             logger.warning(f"세션 확인 실패 — 다음 주기에 재시도: {e}")
         else:
@@ -183,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         return asyncio.run(run(_parse_args(argv)))
-    except (ApiError, auth.LoginAborted) as e:
+    except (ApiError, auth.LoginAborted, SessionBusy) as e:
         logger.error(str(e))
         return EXIT_FAILED
 

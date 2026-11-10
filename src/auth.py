@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import urlsplit
 
-from playwright.async_api import Page, Response
+from playwright.async_api import Page, Request
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from src import config
 from src.api import ApiError, PanelApi, SessionExpired
@@ -27,12 +28,19 @@ ID_INPUT = "#loginId"
 PW_INPUT = "#loginPassword"
 CAPTCHA_INPUT = "input[name='captchaVal']"
 CAPTCHA_IMAGE = ".captcha__image img"
-SUBMIT_BUTTON = "form.auth-form-wrap__login button[type='submit']"
+LOGIN_FORM = "form.auth-form-wrap__login"
+SUBMIT_BUTTON = f"{LOGIN_FORM} button[type='submit']"
 
 LOGIN_API_PATH = "/api/auth/login"
 # 보안문자를 틀렸을 때만 다시 시도한다. 아이디/비밀번호 오류는 5회 누적 시 이용이
 # 제한되므로 자동으로 재시도하지 않는다.
 MAX_CAPTCHA_TRIES = 3
+
+# [로그인]을 누른 뒤 로그인 요청이 나가기를 기다리는 시간. 값이 비었거나 형식이 틀리면
+# (아이디 4~12자, 비밀번호 10~20자) 브라우저나 사이트가 막아 요청이 나가지 않는다.
+SUBMIT_WAIT_MS = 10_000
+RESPONSE_WAIT_SEC = 30
+IN_BROWSER_WAIT_MS = 300_000
 
 _FAIL_MESSAGES = {
     "invalid-captcha": "보안문자를 확인해 주세요.",
@@ -46,7 +54,10 @@ CaptchaPrompt = Callable[[Path], Awaitable[str]]
 @dataclass
 class LoginOutcome:
     ok: bool
-    result: str               # success / invalid-captcha / invalid-login / temp-panel / unknown
+    # success / invalid-captcha / invalid-login / temp-panel / unknown
+    # not-submitted: 사이트가 입력값을 받아들이지 않아 로그인 요청 자체가 나가지 않음
+    # timeout: 브라우저 창에서 제한 시간 안에 로그인하지 않음 / no-response: 응답을 받지 못함
+    result: str
     message: str = ""
     fail_count: int | None = None   # 서버가 알려 준 누적 로그인 실패 횟수
 
@@ -72,7 +83,7 @@ def parse_login_response(status: int, payload: object) -> LoginOutcome:
 
 
 class LoginAborted(Exception):
-    """보안문자 값을 받지 못해 로그인 요청을 보내지 않고 중단함."""
+    """계정 정보나 보안문자 값을 받지 못해 로그인 요청을 보내지 않고 중단함."""
 
 
 async def prompt_captcha(image_path: Path) -> str:
@@ -127,22 +138,18 @@ async def login(
             # 로그인에 실패하면 사이트가 비밀번호 칸을 비우므로 매번 다시 채운다
             await page.fill(PW_INPUT, password)
 
+        captcha_src = ""
         if in_browser:
             logger.info("브라우저 창에서 보안문자를 입력하고 [로그인]을 눌러 주세요 (최대 5분 대기)")
-            async with page.expect_response(_is_login_response, timeout=300_000) as info:
-                pass
         else:
             captcha_src = await _save_captcha(page)
             await page.fill(CAPTCHA_INPUT, await ask_captcha(_captcha_path()))
-            async with page.expect_response(_is_login_response, timeout=30_000) as info:
-                await page.click(SUBMIT_BUTTON)
 
-        response = await info.value
-        payload = await _json(response)
-        outcome = parse_login_response(response.status, payload)
-        if payload is None and response.status == 200 and await _wait_tokens(page):
-            # 로그인 직후 페이지가 이동하면 응답 본문을 못 읽을 수 있다 — 저장된 토큰으로 판단한다
-            outcome = LoginOutcome(ok=True, result="success")
+        request = await _submit(page, in_browser)
+        if request is None:
+            outcome = await _not_submitted(page, in_browser)
+        else:
+            outcome = await _read_outcome(page, request)
         if outcome.ok:
             await _finish_login(page)
             logger.info("로그인 성공 — 세션 저장: %s", config.STATE_PATH)
@@ -177,15 +184,80 @@ def _captcha_path() -> Path:
     return config.STATE_PATH.parent / "captcha.png"
 
 
-def _is_login_response(response: Response) -> bool:
-    return response.request.method == "POST" and urlsplit(response.url).path == LOGIN_API_PATH
+def _is_login_request(request: Request) -> bool:
+    return request.method == "POST" and urlsplit(request.url).path == LOGIN_API_PATH
 
 
-async def _json(response: Response) -> object:
+async def _submit(page: Page, in_browser: bool) -> Request | None:
+    """[로그인]을 누르고(창에서 직접 입력할 때는 사용자가 누르기를 기다리고) 나간 로그인 요청을 돌려준다.
+
+    제한 시간 안에 요청이 나가지 않으면 None.
+    """
+    clicked = False
     try:
-        return await response.json()
-    except Exception:
+        timeout = IN_BROWSER_WAIT_MS if in_browser else SUBMIT_WAIT_MS
+        async with page.expect_request(_is_login_request, timeout=timeout) as info:
+            if not in_browser:
+                await page.click(SUBMIT_BUTTON)
+            clicked = True
+        return await info.value
+    except PlaywrightTimeout:
+        if not clicked:
+            raise       # 버튼을 누르지도 못한 것은 다른 문제다
         return None
+
+
+async def _read_outcome(page: Page, request: Request) -> LoginOutcome:
+    """보낸 로그인 요청의 응답을 기다려 해석한다."""
+    try:
+        response = await asyncio.wait_for(request.response(), RESPONSE_WAIT_SEC)
+    except Exception:
+        response = None
+    if response is None:
+        return LoginOutcome(ok=False, result="no-response",
+                            message="로그인 응답을 받지 못했습니다 — 네트워크 상태를 확인하고 다시 시도하세요")
+    try:
+        payload = await response.json()
+    except Exception:
+        payload = None
+    if payload is None and response.status == 200 and await _wait_tokens(page):
+        # 로그인 직후 페이지가 이동하면 응답 본문을 못 읽을 수 있다 — 저장된 토큰으로 판단한다
+        return LoginOutcome(ok=True, result="success")
+    return parse_login_response(response.status, payload)
+
+
+_FORM_PROBLEM_JS = """
+sel => {
+  const form = document.querySelector(sel);
+  if (!form) return "";
+  // 빈 칸·짧은 값은 브라우저가 먼저 막는다 (required, minlength) — 이때는 사이트 안내문이 뜨지 않는다
+  const invalid = form.querySelector("input:invalid");
+  if (invalid) {
+    const label = invalid.id ? form.querySelector(`label[for="${invalid.id}"]`) : null;
+    const name = (label ? label.textContent : invalid.name || "").trim() || "입력";
+    if (invalid.validity.valueMissing) return `${name} 칸이 비어 있습니다`;
+    if (invalid.validity.tooShort) {
+      return `${name} 칸은 ${invalid.minLength}자 이상이어야 합니다 (현재 ${invalid.value.length}자)`;
+    }
+    return `${name}: ${invalid.validationMessage}`;
+  }
+  const notice = form.querySelector(".login-fail-msg, p.box__info[role='alert']");
+  return notice ? notice.textContent.trim() : "";
+}
+"""
+
+
+async def _not_submitted(page: Page, in_browser: bool) -> LoginOutcome:
+    """로그인 요청이 나가지 않은 까닭을 폼에서 읽어 온다."""
+    if in_browser:
+        return LoginOutcome(ok=False, result="timeout",
+                            message="제한 시간 안에 브라우저 창에서 로그인하지 않았습니다")
+    try:
+        reason = await page.evaluate(_FORM_PROBLEM_JS, LOGIN_FORM)
+    except Exception:
+        reason = ""
+    message = reason or "사이트가 로그인 요청을 보내지 않았습니다 — 아이디(4~12자)·비밀번호(10~20자)를 확인하세요"
+    return LoginOutcome(ok=False, result="not-submitted", message=message)
 
 
 async def _open_login_form(page: Page) -> None:

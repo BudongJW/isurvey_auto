@@ -1,6 +1,7 @@
 """테스트용 가짜 패널파워 — 실제 사이트에 접속하지 않고 브라우저 요청을 가로채 응답한다.
 
-로그인 폼의 셀렉터, 토큰 저장 방식(localStorage), API 응답 형식은 실제 사이트와 같게 흉내 낸다.
+로그인 폼의 셀렉터, 입력값 검사(빈 칸·길이가 틀리면 로그인 요청을 보내지 않음),
+토큰 저장 방식(localStorage), API 응답 형식은 실제 사이트와 같게 흉내 낸다.
 """
 import json
 import struct
@@ -17,8 +18,10 @@ CAPTCHA = "12345"
 
 _LOGIN_PAGE = """<!doctype html><html lang="ko"><body>
 <form class="auth-form-wrap auth-form-wrap__login">
-  <input id="loginId" name="loginId" type="text">
-  <input id="loginPassword" name="loginPassword" type="password">
+  <div class="notice"></div>
+  <label for="loginId">아이디</label><input id="loginId" name="loginId" type="text" minlength="4" required>
+  <label for="loginPassword">비밀번호</label>
+  <input id="loginPassword" name="loginPassword" type="password" minlength="10" required>
   <div class="captcha"><div class="captcha__image"><span class="img-wrap"></span></div>
     <input type="text" name="captchaVal"></div>
   <button type="submit">로그인</button>
@@ -33,9 +36,19 @@ async function loadCaptcha() {
   document.querySelector(".img-wrap").replaceChildren(img);
 }
 loadCaptcha();
+function notify(message) {   // 실제 사이트처럼 안내문이 있을 때만 요소를 그린다
+  const p = document.createElement("p");
+  p.className = "box__info"; p.setAttribute("role", "alert"); p.textContent = message;
+  document.querySelector(".notice").replaceChildren(...(message ? [p] : []));
+}
 document.querySelector("form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const form = e.currentTarget;
+  notify("");
+  const id = form.loginId.value.trim(), pw = form.loginPassword.value;
+  if (!id || !pw) return notify("아이디와 비밀번호를 입력해 주세요.");
+  if (id.length < 4 || id.length > 12) return notify("아이디는 4~12자로 입력해 주세요.");
+  if (pw.length < 10 || pw.length > 20) return notify("비밀번호는 10~20자로 입력해 주세요.");
   const res = await fetch("/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json;charset=UTF-8" },
@@ -54,6 +67,7 @@ document.querySelector("form").addEventListener("submit", async (e) => {
     return;
   }
   form.loginPassword.value = "";
+  notify(json.message || "입력하신 아이디와 비밀번호가 올바르지 않습니다.");
   if (json.data.result === "invalid-captcha") loadCaptcha();
 });
 </script></body></html>""" % json.dumps(config.AUTH_STORAGE_KEY)
@@ -130,7 +144,7 @@ class FakePanelSite:
             if body.get("captchaVal") != CAPTCHA:
                 return 400, {"code": 400, "message": "보안문자를 확인해 주세요.",
                              "data": {"result": "invalid-captcha", "loginFailCnt": 0}}
-            if body.get("userId") != USER_ID or not body.get("password"):
+            if body.get("userId") != USER_ID or body.get("password") != PASSWORD:
                 return 400, {"code": 400, "data": {"result": "invalid-login", "loginFailCnt": 1}}
             return ok({**self._issue_tokens(), "userId": USER_ID, "name": "테스터"})
 

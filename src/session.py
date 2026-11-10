@@ -3,8 +3,9 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import IO, AsyncIterator
 
 from playwright.async_api import Page, async_playwright
 
@@ -12,15 +13,80 @@ from src import config
 
 logger = logging.getLogger(__name__)
 
+# 다른 실행이 세션을 쓰는 동안 기다리는 시간(초). 조회·갱신은 몇 초면 끝난다.
+# 로그인(보안문자 입력 대기)처럼 오래 걸리는 실행과 겹치면 기다리다 포기한다.
+LOCK_WAIT_SEC = 60
+
+
+class SessionBusy(Exception):
+    """다른 실행이 세션을 쓰고 있어 기다리다 포기함."""
+
+
+if os.name == "nt":
+    import msvcrt
+
+    def _try_lock(file: IO[bytes]) -> bool:
+        try:
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(file: IO[bytes]) -> None:
+        file.seek(0)
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _try_lock(file: IO[bytes]) -> bool:
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(file: IO[bytes]) -> None:
+        fcntl.flock(file, fcntl.LOCK_UN)
+
+
+@asynccontextmanager
+async def _session_lock(wait_sec: float | None = None) -> AsyncIterator[None]:
+    """세션 파일을 한 번에 한 실행만 쓰게 한다 (불러오기 → 사용 → 저장을 통째로 잠근다).
+
+    리프레시 토큰은 갱신할 때마다 교체된다. keepalive 와 다른 명령이 겹쳐 돌면 한쪽이
+    교체 전 토큰을 나중에 저장해 세션이 끊길 수 있으므로, 앞선 실행이 끝나기를 기다린다.
+    """
+    wait_sec = LOCK_WAIT_SEC if wait_sec is None else wait_sec
+    path = config.STATE_PATH.with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as file:
+        deadline = time.monotonic() + wait_sec
+        waiting = False
+        while not _try_lock(file):
+            if time.monotonic() >= deadline:
+                raise SessionBusy(
+                    f"다른 실행이 세션을 사용 중입니다 ({wait_sec:g}초 대기) — 끝난 뒤 다시 실행하세요"
+                )
+            if not waiting:
+                waiting = True
+                logger.info(f"다른 실행이 세션을 사용 중입니다 — 끝나기를 기다립니다 (최대 {wait_sec:g}초)")
+            await asyncio.sleep(0.2)
+        try:
+            yield
+        finally:
+            _unlock(file)
+
 
 @asynccontextmanager
 async def open_session(*, headless: bool | None = None) -> AsyncIterator[Page]:
     """저장된 세션이 있으면 불러온 브라우저 페이지를 연다.
 
     끝날 때 로그인 상태면 세션을 다시 저장한다. 리프레시 토큰은 쓸 때마다 새 값으로
-    바뀌므로, 저장하지 않으면 다음 실행에서 세션이 끊긴다.
+    바뀌므로, 저장하지 않으면 다음 실행에서 세션이 끊긴다. 여는 동안에는 다른 실행이
+    같은 세션 파일을 쓰지 못하게 잠근다.
     """
-    async with async_playwright() as p:
+    async with _session_lock(), async_playwright() as p:
         browser = await p.chromium.launch(
             headless=config.HEADLESS if headless is None else headless,
             executable_path=config.CHROMIUM_PATH,
